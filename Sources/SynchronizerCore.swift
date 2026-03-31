@@ -4,6 +4,11 @@ import Foundation
 
 private let blueStacksConfigPath = "/Users/Shared/Library/Application Support/BlueStacks/bluestacks.conf"
 private let blueStacksMappingDir = "/Users/Shared/Library/Application Support/BlueStacks/Engine/UserData/InputMapper/UserFiles"
+private let blueStacksBundleIDs = [
+    "com.now.gg.BlueStacks",
+    "com.bluestacks.BlueStacks"
+]
+private let blueStacksADBRelativePath = "Contents/MacOS/hd-adb"
 
 struct Config {
     let sourcePID: pid_t
@@ -31,7 +36,26 @@ private struct BlueStacksInstance {
     let adbPort: Int
 }
 
+private func blueStacksADBPath() -> String? {
+    for bundleID in blueStacksBundleIDs {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            let adbURL = appURL.appendingPathComponent(blueStacksADBRelativePath)
+            if FileManager.default.isExecutableFile(atPath: adbURL.path) {
+                return adbURL.path
+            }
+        }
+    }
+
+    let fallbackPaths = [
+        "/Applications/BlueStacks.app/\(blueStacksADBRelativePath)",
+        "\(NSHomeDirectory())/Applications/BlueStacks.app/\(blueStacksADBRelativePath)"
+    ]
+
+    return fallbackPaths.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
+}
+
 private func runProcess(_ args: [String]) -> (status: Int32, stdout: String, stderr: String)? {
+    guard !args.isEmpty else { return nil }
     let process = Process()
     process.executableURL = URL(fileURLWithPath: args[0])
     process.arguments = Array(args.dropFirst())
@@ -58,8 +82,11 @@ private func runProcess(_ args: [String]) -> (status: Int32, stdout: String, std
 }
 
 private func adbDevices() -> [String] {
+    guard let adbPath = blueStacksADBPath() else {
+        return []
+    }
     guard let result = runProcess([
-        "/Applications/BlueStacks.app/Contents/MacOS/hd-adb",
+        adbPath,
         "devices", "-l"
     ]), result.status == 0 else {
         return []
@@ -78,6 +105,9 @@ private func adbDevices() -> [String] {
 }
 
 private func ensureADBConnected(serial: String) -> Bool {
+    guard let adbPath = blueStacksADBPath() else {
+        return false
+    }
     let current = Set(adbDevices())
     if current.contains(serial) {
         return true
@@ -88,7 +118,7 @@ private func ensureADBConnected(serial: String) -> Bool {
     }
 
     _ = runProcess([
-        "/Applications/BlueStacks.app/Contents/MacOS/hd-adb",
+        adbPath,
         "connect", serial
     ])
 
@@ -213,12 +243,15 @@ final class ADBSynchronizer {
     }
 
     private func verifyADB() -> Bool {
+        guard let adbPath = blueStacksADBPath() else {
+            return false
+        }
         if !ensureADBConnected(serial: config.targetADBSerial) {
             return false
         }
 
         return runCommand([
-            "/Applications/BlueStacks.app/Contents/MacOS/hd-adb",
+            adbPath,
             "-s", config.targetADBSerial,
             "shell", "-T", "getprop", "ro.serialno"
         ]) != nil
@@ -458,8 +491,9 @@ final class ADBSynchronizer {
     }
 
     private func androidDisplaySize(serial: String) -> CGSize? {
+        guard let adbPath = blueStacksADBPath() else { return nil }
         guard let output = runCommand([
-            "/Applications/BlueStacks.app/Contents/MacOS/hd-adb",
+            adbPath,
             "-s", serial,
             "shell", "-T", "wm", "size"
         ]) else { return nil }
@@ -479,8 +513,9 @@ final class ADBSynchronizer {
     }
 
     private func sendTap(serial: String, x: Int, y: Int) -> Bool {
-        runCommand([
-            "/Applications/BlueStacks.app/Contents/MacOS/hd-adb",
+        guard let adbPath = blueStacksADBPath() else { return false }
+        return runCommand([
+            adbPath,
             "-s", serial,
             "shell", "-T", "input", "tap",
             String(x), String(y)
@@ -488,8 +523,9 @@ final class ADBSynchronizer {
     }
 
     private func sendSwipe(serial: String, fromX: Int, fromY: Int, toX: Int, toY: Int, durationMs: Int) -> Bool {
-        runCommand([
-            "/Applications/BlueStacks.app/Contents/MacOS/hd-adb",
+        guard let adbPath = blueStacksADBPath() else { return false }
+        return runCommand([
+            adbPath,
             "-s", serial,
             "shell", "-T", "input", "swipe",
             String(fromX), String(fromY),
@@ -760,9 +796,12 @@ func adbSerial(for targetPID: pid_t) -> String? {
 }
 
 func foregroundPackage(serial: String) -> String? {
+    guard let adbPath = blueStacksADBPath() else {
+        return nil
+    }
     let commands: [[String]] = [
-        ["/Applications/BlueStacks.app/Contents/MacOS/hd-adb", "-s", serial, "shell", "-T", "dumpsys", "window", "windows"],
-        ["/Applications/BlueStacks.app/Contents/MacOS/hd-adb", "-s", serial, "shell", "-T", "dumpsys", "activity", "activities"]
+        [adbPath, "-s", serial, "shell", "-T", "dumpsys", "window", "windows"],
+        [adbPath, "-s", serial, "shell", "-T", "dumpsys", "activity", "activities"]
     ]
 
     let patterns = [
