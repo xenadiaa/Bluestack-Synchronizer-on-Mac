@@ -3,7 +3,7 @@ import ApplicationServices
 import Foundation
 import SwiftUI
 
-private let synchronizerScriptPath = "/Users/xenadia/Documents/Playground/tools/Synchronizer/window_sync.swift"
+private let bundledHelperFlag = "--run-bundled-helper"
 
 struct ProcessCandidate: Identifiable, Hashable {
     let pid: pid_t
@@ -48,6 +48,8 @@ final class AppModel: ObservableObject {
     }
 
     func refreshProcesses() {
+        let previousSourcePID = sourcePID
+        let previousTargetPID = targetPID
         let discovered = discoverCandidates()
         candidates = discovered
 
@@ -60,6 +62,14 @@ final class AppModel: ObservableObject {
         if let sourcePID, sourcePID == targetPID {
             self.targetPID = nil
         }
+
+        let selectionChanged = previousSourcePID != sourcePID || previousTargetPID != targetPID
+        let selectionInvalid = sourcePID == nil || targetPID == nil
+        if isRunning && (selectionChanged || selectionInvalid) {
+            stop()
+            statusText = "实例已刷新，请重新连接"
+            appendLog("检测到实例列表变化，已自动断开当前同步，请重新选择源和目标实例后再连接。")
+        }
     }
 
     func start() {
@@ -69,20 +79,20 @@ final class AppModel: ObservableObject {
             appendLog("缺少源或目标 BlueStacks 实例。")
             return
         }
+        guard requestAccessibilityPermissionIfNeeded() else {
+            statusText = "缺少辅助功能权限"
+            appendLog("请在系统设置中为 BlueStacks Synchronizer 开启辅助功能和输入监控，然后完全退出并重新打开 App。")
+            return
+        }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-
-        var arguments = ["swift", synchronizerScriptPath, "--source-pid", String(sourcePID), "--target-pid", String(targetPID)]
-        if verbose {
-            arguments.append("--verbose")
+        guard let executableURL = Bundle.main.executableURL else {
+            statusText = "启动失败"
+            appendLog("无法定位 App 主可执行文件。")
+            return
         }
-        process.arguments = arguments
-
-        var environment = ProcessInfo.processInfo.environment
-        environment["SWIFT_MODULECACHE_PATH"] = "/tmp/swift-module-cache"
-        environment["CLANG_MODULE_CACHE_PATH"] = "/tmp/clang-module-cache"
-        process.environment = environment
+        process.executableURL = executableURL
+        process.arguments = [bundledHelperFlag] + buildSynchronizerArguments(sourcePID: sourcePID, targetPID: targetPID)
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -170,6 +180,23 @@ final class AppModel: ObservableObject {
         let normalized = message.hasSuffix("\n") ? message : message + "\n"
         logText += normalized
     }
+
+    private func requestAccessibilityPermissionIfNeeded() -> Bool {
+        if AXIsProcessTrusted() {
+            return true
+        }
+        return AXIsProcessTrustedWithOptions([
+            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+        ] as CFDictionary)
+    }
+
+    private func buildSynchronizerArguments(sourcePID: pid_t, targetPID: pid_t) -> [String] {
+        var arguments = ["--source-pid", String(sourcePID), "--target-pid", String(targetPID)]
+        if verbose {
+            arguments.append("--verbose")
+        }
+        return arguments
+    }
 }
 
 struct ContentView: View {
@@ -242,10 +269,26 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("运行日志")
                     .font(.headline)
-                TextEditor(text: $model.logText)
-                    .font(.system(.body, design: .monospaced))
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        Text(model.logText.isEmpty ? "暂无日志" : model.logText)
+                            .font(.system(.body, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .padding(8)
+                        Color.clear
+                            .frame(height: 1)
+                            .id("log-bottom")
+                    }
                     .frame(minHeight: 320)
                     .border(Color.secondary.opacity(0.3))
+                    .onChange(of: model.logText) { _ in
+                        proxy.scrollTo("log-bottom", anchor: .bottom)
+                    }
+                    .onAppear {
+                        proxy.scrollTo("log-bottom", anchor: .bottom)
+                    }
+                }
             }
         }
         .padding(20)
@@ -260,6 +303,13 @@ struct ContentView: View {
 
 @main
 struct SynchronizerAppMain: App {
+    init() {
+        if CommandLine.arguments.contains(bundledHelperFlag) {
+            let args = Array(CommandLine.arguments.dropFirst()).filter { $0 != bundledHelperFlag }
+            runBundledSynchronizer(with: args)
+        }
+    }
+
     var body: some Scene {
         WindowGroup("BlueStacks Synchronizer") {
             ContentView()
@@ -268,7 +318,7 @@ struct SynchronizerAppMain: App {
     }
 }
 
-private func discoverCandidates(preferredAppName: String = "BlueStacks") -> [ProcessCandidate] {
+func discoverCandidates(preferredAppName: String = "BlueStacks") -> [ProcessCandidate] {
     let workspace = NSWorkspace.shared
     let runningApps = workspace.runningApplications.filter { app in
         app.processIdentifier != ProcessInfo.processInfo.processIdentifier
@@ -301,7 +351,7 @@ private func discoverCandidates(preferredAppName: String = "BlueStacks") -> [Pro
     }
 }
 
-private func preferredWindowTitle(for pid: pid_t) -> String? {
+func preferredWindowTitle(for pid: pid_t) -> String? {
     let appElement = AXUIElementCreateApplication(pid)
     var value: CFTypeRef?
 
@@ -311,14 +361,15 @@ private func preferredWindowTitle(for pid: pid_t) -> String? {
         let result = AXUIElementCopyAttributeValue(appElement, attribute as CFString, &value)
         if result == .success,
            let window = value,
-           let title = windowTitle(from: unsafeBitCast(window, to: AXUIElement.self)) {
+           CFGetTypeID(window) == AXUIElementGetTypeID(),
+           let title = windowTitle(from: window as! AXUIElement) {
             return title
         }
     }
     return nil
 }
 
-private func windowTitle(from window: AXUIElement) -> String? {
+func windowTitle(from window: AXUIElement) -> String? {
     var value: CFTypeRef?
     let result = AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &value)
     guard result == .success,
