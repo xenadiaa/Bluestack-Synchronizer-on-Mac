@@ -1,5 +1,54 @@
 # BlueStacks 同步器说明文档
 
+## 0. 更新后重新授权
+
+如果你替换了 `/Applications/BlueStacks Synchronizer.app`，macOS 可能会把它当成一份“新的 App 身份”。这时即使你之前已经勾选过：
+
+- `辅助功能`
+- `输入监控`
+
+运行时也仍然可能提示缺权限，或者反复请求权限。
+
+最稳的处理方式是：每次更新 App 后，都重新对安装版 App 签名，并重置一次权限记录，然后再重新授权。
+
+### 0.1 重新签名
+
+```bash
+codesign --force --deep --sign - "/Applications/BlueStacks Synchronizer.app"
+```
+
+### 0.2 重置权限记录
+
+```bash
+tccutil reset Accessibility local.codex.bluestacks-synchronizer
+tccutil reset ListenEvent local.codex.bluestacks-synchronizer
+```
+
+### 0.3 重新授权步骤
+
+1. 完全退出 `/Applications/BlueStacks Synchronizer.app`
+2. 运行上面的签名和重置命令
+3. 打开 `系统设置 -> 隐私与安全性`
+4. 重新给 `BlueStacks Synchronizer.app` 开启：
+   - `辅助功能`
+   - `输入监控`
+5. 再重新打开 `/Applications/BlueStacks Synchronizer.app`
+
+### 0.4 为什么要这样做
+
+这个问题通常不是“权限没开”，而是：
+
+- App 被重新编译或替换过
+- 安装版 App 的签名状态和之前不同
+- TCC 里旧的授权记录没有正确绑定到当前这份二进制
+
+所以修复重点不是反复点授权，而是：
+
+- 先让 `/Applications` 里的安装版 App 重新获得稳定签名
+- 再让 macOS 重新建立这份 App 的权限记录
+
+建议以后每次更新安装版 App 后，都执行一次这一节里的流程。
+
 ## 1. 文档目的
 
 这份文档同时承担两部分内容：
