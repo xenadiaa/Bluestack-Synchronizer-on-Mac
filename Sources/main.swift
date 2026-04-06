@@ -23,6 +23,9 @@ struct ProcessCandidate: Identifiable, Hashable {
 
 @MainActor
 final class AppModel: ObservableObject {
+    private static let maxLogCharacters = 20000
+    private static let logScrollThrottleSeconds = 0.15
+
     @Published var candidates: [ProcessCandidate] = []
     @Published var sourcePID: pid_t?
     @Published var targetPID: pid_t?
@@ -30,10 +33,13 @@ final class AppModel: ObservableObject {
     @Published var isRunning = false
     @Published var statusText = "未启动"
     @Published var logText = ""
+    @Published var logScrollVersion = 0
 
     private var process: Process?
     private var stdoutObserver: NSObjectProtocol?
     private var stderrObserver: NSObjectProtocol?
+    private var pendingLogScrollWorkItem: DispatchWorkItem?
+    private var permissionMonitorTimer: Timer?
 
     init() {
         refreshProcesses()
@@ -138,6 +144,7 @@ final class AppModel: ObservableObject {
             isRunning = true
             statusText = "运行中"
             appendLog("已启动同步器：source=\(sourcePID) target=\(targetPID)")
+            startPermissionMonitor()
         } catch {
             statusText = "启动失败"
             appendLog("启动失败：\(error.localizedDescription)")
@@ -153,6 +160,7 @@ final class AppModel: ObservableObject {
         self.process = nil
         isRunning = false
         statusText = "已停止"
+        stopPermissionMonitor()
         cleanupObservers()
     }
 
@@ -176,9 +184,47 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func startPermissionMonitor() {
+        stopPermissionMonitor()
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self, self.isRunning else { return }
+            guard self.hasRuntimePermissions() else {
+                self.appendLog("检测到辅助功能或输入监控权限失效，已自动停止同步。")
+                self.stop()
+                self.statusText = "权限失效，已停止"
+                return
+            }
+        }
+        permissionMonitorTimer = timer
+    }
+
+    private func stopPermissionMonitor() {
+        permissionMonitorTimer?.invalidate()
+        permissionMonitorTimer = nil
+    }
+
     private func appendLog(_ message: String) {
         let normalized = message.hasSuffix("\n") ? message : message + "\n"
         logText += normalized
+        if logText.count > Self.maxLogCharacters {
+            let overflow = logText.count - Self.maxLogCharacters
+            let trimIndex = logText.index(logText.startIndex, offsetBy: overflow)
+            if let nextLineBreak = logText[trimIndex...].firstIndex(of: "\n") {
+                logText = String(logText[logText.index(after: nextLineBreak)...])
+            } else {
+                logText = String(logText.suffix(Self.maxLogCharacters))
+            }
+        }
+        scheduleLogScroll()
+    }
+
+    private func scheduleLogScroll() {
+        pendingLogScrollWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.logScrollVersion += 1
+        }
+        pendingLogScrollWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.logScrollThrottleSeconds, execute: workItem)
     }
 
     private func requestAccessibilityPermissionIfNeeded() -> Bool {
@@ -188,6 +234,10 @@ final class AppModel: ObservableObject {
         return AXIsProcessTrustedWithOptions([
             kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
         ] as CFDictionary)
+    }
+
+    private func hasRuntimePermissions() -> Bool {
+        AXIsProcessTrusted() && CGPreflightListenEventAccess()
     }
 
     private func buildSynchronizerArguments(sourcePID: pid_t, targetPID: pid_t) -> [String] {
@@ -282,7 +332,7 @@ struct ContentView: View {
                     }
                     .frame(minHeight: 320)
                     .border(Color.secondary.opacity(0.3))
-                    .onChange(of: model.logText) { _ in
+                    .onChange(of: model.logScrollVersion) { _ in
                         proxy.scrollTo("log-bottom", anchor: .bottom)
                     }
                     .onAppear {

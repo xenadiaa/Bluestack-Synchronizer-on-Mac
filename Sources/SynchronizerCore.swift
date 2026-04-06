@@ -126,6 +126,11 @@ private func ensureADBConnected(serial: String) -> Bool {
 }
 
 final class ADBSynchronizer {
+    private static let minimumScrollGesturePixels = 36
+    private static let scrollCoalesceDelay: TimeInterval = 0.05
+    private static let minimumScrollDurationMs = 50
+    private static let maximumScrollDurationMs = 1200
+
     private let config: Config
     private let workspace = NSWorkspace.shared
     private let adbQueue = DispatchQueue(label: "tools.synchronizer.adb", qos: .userInitiated)
@@ -134,6 +139,12 @@ final class ADBSynchronizer {
     private var cachedMappingContext: (package: String?, path: String, mappings: [String: TapMapping])?
     private var activeLeftTouchStart: CGPoint?
     private var activeLeftTouchCurrent: CGPoint?
+    private var activeLeftTouchStartedAt: CFTimeInterval?
+    private var pendingScrollDeltaX: Int64 = 0
+    private var pendingScrollDeltaY: Int64 = 0
+    private var pendingScrollPoint: CGPoint?
+    private var pendingScrollStartedAt: CFTimeInterval?
+    private var pendingScrollGeneration: Int = 0
     private let injectedMarker: Int64 = 0x53494E43
 
     init(config: Config) {
@@ -191,7 +202,7 @@ final class ADBSynchronizer {
         } else {
             print("Mapping mode: auto-resolve from target foreground package")
         }
-        print("Mouse mirror: left/right/other move/down/drag/up")
+        print("Mouse mirror: move/down/drag/up + scroll")
         print("Press Control+C to stop.")
 
         RunLoop.current.run()
@@ -201,6 +212,7 @@ final class ADBSynchronizer {
         let eventTypes: [CGEventType] = [
             .keyDown, .keyUp,
             .mouseMoved,
+            .scrollWheel,
             .leftMouseDown, .leftMouseDragged, .leftMouseUp,
             .rightMouseDown, .rightMouseDragged, .rightMouseUp,
             .otherMouseDown, .otherMouseDragged, .otherMouseUp
@@ -258,6 +270,11 @@ final class ADBSynchronizer {
     }
 
     private func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        guard hasAccessibilityPermission() else {
+            print("Accessibility permission lost. Stopping synchronizer.")
+            exit(2)
+        }
+
         if event.getIntegerValueField(.eventSourceUserData) == injectedMarker {
             return Unmanaged.passRetained(event)
         }
@@ -273,6 +290,7 @@ final class ADBSynchronizer {
         case .keyUp:
             return Unmanaged.passRetained(event)
         case .mouseMoved,
+             .scrollWheel,
              .leftMouseDown, .leftMouseDragged, .leftMouseUp,
              .rightMouseDown, .rightMouseDragged, .rightMouseUp,
              .otherMouseDown, .otherMouseDragged, .otherMouseUp:
@@ -286,6 +304,25 @@ final class ADBSynchronizer {
     private func handleKeyDown(_ event: CGEvent) -> Unmanaged<CGEvent>? {
         let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
         if isRepeat {
+            return Unmanaged.passRetained(event)
+        }
+
+        if isEmergencyExitHotkey(event) {
+            print("Emergency exit hotkey received. Stopping synchronizer.")
+            exit(0)
+        }
+
+        if let systemAction = sidebarSystemAction(for: event) {
+            adbQueue.async { [self] in
+                let succeeded = sendKeyEvent(serial: config.targetADBSerial, keycode: systemAction.keycode)
+                if config.verbose {
+                    if succeeded {
+                        print("Triggered sidebar action \(systemAction.name) via keyevent \(systemAction.keycode)")
+                    } else {
+                        print("Failed sidebar action \(systemAction.name) via keyevent \(systemAction.keycode)")
+                    }
+                }
+            }
             return Unmanaged.passRetained(event)
         }
 
@@ -328,11 +365,17 @@ final class ADBSynchronizer {
         case .leftMouseDown, .leftMouseDragged, .leftMouseUp:
             mirrorPrimaryMouseAsTouch(type: type, event: event)
         case .mouseMoved:
-            guard let targetPoint = mappedPoint(from: event.location, sourcePID: config.sourcePID, targetPID: config.targetPID) else {
+            _ = mappedPoint(from: event.location, sourcePID: config.sourcePID, targetPID: config.targetPID)
+        case .scrollWheel:
+            guard let displayPoint = mappedDisplayPoint(from: event.location) else {
                 return
             }
+            let deltaY = event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1)
+            let deltaX = event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2)
+            scheduleScrollGesture(at: displayPoint, deltaX: deltaX, deltaY: deltaY)
+
             if config.verbose {
-                print("Mirrored mouse \(mouseEventName(type)) button=0 -> (\(Int(targetPoint.x)), \(Int(targetPoint.y)))")
+                print("Mirrored mouse scroll as gesture dx=\(deltaX) dy=\(deltaY)")
             }
         case .rightMouseDown, .rightMouseDragged, .rightMouseUp,
              .otherMouseDown, .otherMouseDragged, .otherMouseUp:
@@ -353,7 +396,143 @@ final class ADBSynchronizer {
         }
     }
 
+    private func scheduleScrollGesture(at point: CGPoint, deltaX: Int64, deltaY: Int64) {
+        let generation = stateQueue.sync { () -> Int in
+            pendingScrollDeltaX += deltaX
+            pendingScrollDeltaY += deltaY
+            pendingScrollPoint = point
+            if pendingScrollStartedAt == nil {
+                pendingScrollStartedAt = CFAbsoluteTimeGetCurrent()
+            }
+            pendingScrollGeneration += 1
+            return pendingScrollGeneration
+        }
+
+        adbQueue.asyncAfter(deadline: .now() + Self.scrollCoalesceDelay) { [self] in
+            let scrollState = stateQueue.sync { () -> (CGPoint, Int64, Int64, CFTimeInterval)? in
+                guard generation == pendingScrollGeneration else {
+                    return nil
+                }
+                guard let point = pendingScrollPoint else {
+                    return nil
+                }
+                let dx = pendingScrollDeltaX
+                let dy = pendingScrollDeltaY
+                let startedAt = pendingScrollStartedAt ?? CFAbsoluteTimeGetCurrent()
+                pendingScrollDeltaX = 0
+                pendingScrollDeltaY = 0
+                pendingScrollPoint = nil
+                pendingScrollStartedAt = nil
+                return (point, dx, dy, startedAt)
+            }
+
+            guard let (scrollPoint, mergedDeltaX, mergedDeltaY, startedAt) = scrollState,
+                  let (scaleX, scaleY) = scrollScaleFactors() else { return }
+
+            let translatedX = Int((Double(mergedDeltaX) * scaleX).rounded())
+            let translatedY = Int((Double(mergedDeltaY) * scaleY).rounded())
+
+            let belowThreshold = abs(translatedX) < Self.minimumScrollGesturePixels
+                && abs(translatedY) < Self.minimumScrollGesturePixels
+            if belowThreshold {
+                if config.verbose {
+                    print("Ignored undersized scroll gesture dx=\(translatedX) dy=\(translatedY)")
+                }
+                return
+            }
+
+            guard let displaySize = displaySize() else { return }
+            let displayWidth = max(1, Int(displaySize.width))
+            let displayHeight = max(1, Int(displaySize.height))
+            let startX = min(max(Int(scrollPoint.x), 0), displayWidth - 1)
+            let startY = min(max(Int(scrollPoint.y), 0), displayHeight - 1)
+            let endX = min(max(startX + translatedX, 0), displayWidth - 1)
+            let endY = min(max(startY + translatedY, 0), displayHeight - 1)
+            let observedMs = Int(((CFAbsoluteTimeGetCurrent() - startedAt) * 1000).rounded())
+            let elapsedMs = max(
+                Self.minimumScrollDurationMs,
+                min(Self.maximumScrollDurationMs, observedMs)
+            )
+
+            let succeeded = sendSwipe(
+                serial: config.targetADBSerial,
+                fromX: startX,
+                fromY: startY,
+                toX: endX,
+                toY: endY,
+                durationMs: elapsedMs
+            )
+
+            if config.verbose {
+                if succeeded {
+                    print("Coalesced scroll gesture dx=\(translatedX) dy=\(translatedY) duration=\(elapsedMs)ms")
+                } else {
+                    print("ADB scroll gesture failed from (\(startX), \(startY)) to (\(endX), \(endY))")
+                }
+            }
+        }
+    }
+
+    private func scrollScaleFactors() -> (Double, Double)? {
+        guard let sourceFrame = interactionFrame(for: config.sourcePID),
+              let displaySize = displaySize(),
+              sourceFrame.width > 0,
+              sourceFrame.height > 0 else {
+            return nil
+        }
+
+        return (
+            Double(displaySize.width / sourceFrame.width),
+            Double(displaySize.height / sourceFrame.height)
+        )
+    }
+
+    private func rebuiltScrollEvent(from event: CGEvent, targetPoint: CGPoint) -> CGEvent? {
+        let isContinuous = event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
+        let units: CGScrollEventUnit = isContinuous ? .pixel : .line
+        let wheel1Field: CGEventField = isContinuous ? .scrollWheelEventPointDeltaAxis1 : .scrollWheelEventDeltaAxis1
+        let wheel2Field: CGEventField = isContinuous ? .scrollWheelEventPointDeltaAxis2 : .scrollWheelEventDeltaAxis2
+        let wheel3Field: CGEventField = isContinuous ? .scrollWheelEventPointDeltaAxis3 : .scrollWheelEventDeltaAxis3
+
+        let wheel1 = Int32(event.getIntegerValueField(wheel1Field))
+        let wheel2 = Int32(event.getIntegerValueField(wheel2Field))
+        let wheel3 = Int32(event.getIntegerValueField(wheel3Field))
+
+        guard let rebuilt = CGEvent(
+            scrollWheelEvent2Source: nil,
+            units: units,
+            wheelCount: 3,
+            wheel1: wheel1,
+            wheel2: wheel2,
+            wheel3: wheel3
+        ) else {
+            return nil
+        }
+
+        rebuilt.location = targetPoint
+        rebuilt.flags = event.flags
+        rebuilt.setIntegerValueField(.scrollWheelEventDeltaAxis1, value: event.getIntegerValueField(.scrollWheelEventDeltaAxis1))
+        rebuilt.setIntegerValueField(.scrollWheelEventDeltaAxis2, value: event.getIntegerValueField(.scrollWheelEventDeltaAxis2))
+        rebuilt.setIntegerValueField(.scrollWheelEventDeltaAxis3, value: event.getIntegerValueField(.scrollWheelEventDeltaAxis3))
+        rebuilt.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1))
+        rebuilt.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2))
+        rebuilt.setIntegerValueField(.scrollWheelEventPointDeltaAxis3, value: event.getIntegerValueField(.scrollWheelEventPointDeltaAxis3))
+        rebuilt.setIntegerValueField(.scrollWheelEventFixedPtDeltaAxis1, value: event.getIntegerValueField(.scrollWheelEventFixedPtDeltaAxis1))
+        rebuilt.setIntegerValueField(.scrollWheelEventFixedPtDeltaAxis2, value: event.getIntegerValueField(.scrollWheelEventFixedPtDeltaAxis2))
+        rebuilt.setIntegerValueField(.scrollWheelEventFixedPtDeltaAxis3, value: event.getIntegerValueField(.scrollWheelEventFixedPtDeltaAxis3))
+        rebuilt.setIntegerValueField(.scrollWheelEventIsContinuous, value: event.getIntegerValueField(.scrollWheelEventIsContinuous))
+        rebuilt.setIntegerValueField(.scrollWheelEventScrollPhase, value: event.getIntegerValueField(.scrollWheelEventScrollPhase))
+        rebuilt.setIntegerValueField(.scrollWheelEventMomentumPhase, value: event.getIntegerValueField(.scrollWheelEventMomentumPhase))
+        rebuilt.setIntegerValueField(.eventTargetUnixProcessID, value: Int64(config.targetPID))
+        return rebuilt
+    }
+
     private func mirrorPrimaryMouseAsTouch(type: CGEventType, event: CGEvent) {
+        if let chromeTargetPoint = mappedChromePoint(from: event.location) {
+            mirrorChromePrimaryMouse(type: type, event: event, targetPoint: chromeTargetPoint)
+            return
+        }
+
         guard let displayPoint = mappedDisplayPoint(from: event.location) else {
             return
         }
@@ -363,59 +542,82 @@ final class ADBSynchronizer {
             stateQueue.sync {
                 activeLeftTouchStart = displayPoint
                 activeLeftTouchCurrent = displayPoint
+                activeLeftTouchStartedAt = CFAbsoluteTimeGetCurrent()
             }
             if config.verbose {
-                print("Mirrored mouse leftDown as touchStart -> (\(Int(displayPoint.x)), \(Int(displayPoint.y)))")
+                print("Mirrored mouse leftDown as dragStart -> (\(Int(displayPoint.x)), \(Int(displayPoint.y)))")
             }
         case .leftMouseDragged:
             stateQueue.sync {
                 activeLeftTouchCurrent = displayPoint
             }
             if config.verbose {
-                print("Mirrored mouse leftDragged as touchMove -> (\(Int(displayPoint.x)), \(Int(displayPoint.y)))")
+                print("Mirrored mouse leftDragged as dragMove -> (\(Int(displayPoint.x)), \(Int(displayPoint.y)))")
             }
         case .leftMouseUp:
-            let touchPath = stateQueue.sync { () -> (CGPoint, CGPoint)? in
+            let touchPath = stateQueue.sync { () -> (CGPoint, CGPoint, CFTimeInterval)? in
                 guard let start = activeLeftTouchStart else {
                     return nil
                 }
                 let end = activeLeftTouchCurrent ?? displayPoint
+                let startedAt = activeLeftTouchStartedAt ?? CFAbsoluteTimeGetCurrent()
                 activeLeftTouchStart = nil
                 activeLeftTouchCurrent = nil
-                return (start, end)
+                activeLeftTouchStartedAt = nil
+                return (start, end, startedAt)
             }
 
-            let finalPath = touchPath ?? (displayPoint, displayPoint)
+            let finalPath = touchPath ?? (displayPoint, displayPoint, CFAbsoluteTimeGetCurrent())
             adbQueue.async { [self] in
                 let start = finalPath.0
                 let end = finalPath.1
+                let startedAt = finalPath.2
                 let distance = hypot(end.x - start.x, end.y - start.y)
-                let succeeded: Bool
 
                 if distance < 8 {
-                    succeeded = sendTap(serial: config.targetADBSerial, x: Int(end.x), y: Int(end.y))
+                    let succeeded = sendTap(serial: config.targetADBSerial, x: Int(end.x), y: Int(end.y))
+                    if config.verbose {
+                        if succeeded {
+                            print("Mirrored mouse leftUp with tap fallback -> (\(Int(end.x)), \(Int(end.y)))")
+                        } else {
+                            print("ADB tap fallback failed for mirrored left click")
+                        }
+                    }
                 } else {
-                    succeeded = sendSwipe(
+                    let observedMs = Int(((CFAbsoluteTimeGetCurrent() - startedAt) * 1000).rounded())
+                    let durationMs = max(120, min(1200, observedMs))
+                    let succeeded = sendSwipe(
                         serial: config.targetADBSerial,
                         fromX: Int(start.x),
                         fromY: Int(start.y),
                         toX: Int(end.x),
                         toY: Int(end.y),
-                        durationMs: 120
+                        durationMs: durationMs
                     )
-                }
-
-                if config.verbose {
-                    let action = distance < 8 ? "tap" : "swipe"
-                    if succeeded {
-                        print("Mirrored mouse leftUp as \(action) -> (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y)))")
-                    } else {
-                        print("ADB \(action) failed for mirrored left mouse event")
+                    if config.verbose {
+                        if succeeded {
+                            print("Mirrored mouse leftUp as coalesced drag -> (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y))) duration=\(durationMs)ms")
+                        } else {
+                            print("ADB coalesced drag failed from (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y)))")
+                        }
                     }
                 }
             }
         default:
             break
+        }
+    }
+
+    private func mirrorChromePrimaryMouse(type: CGEventType, event: CGEvent, targetPoint: CGPoint) {
+        guard let rebuilt = rebuiltMouseEvent(from: event, type: type, targetPoint: targetPoint) else {
+            return
+        }
+
+        rebuilt.setIntegerValueField(.eventSourceUserData, value: injectedMarker)
+        rebuilt.postToPid(config.targetPID)
+
+        if config.verbose {
+            print("Mirrored chrome mouse \(mouseEventName(type)) -> (\(Int(targetPoint.x)), \(Int(targetPoint.y)))")
         }
     }
 
@@ -453,6 +655,7 @@ final class ADBSynchronizer {
     private func mouseEventName(_ type: CGEventType) -> String {
         switch type {
         case .mouseMoved: return "moved"
+        case .scrollWheel: return "scroll"
         case .leftMouseDown: return "leftDown"
         case .leftMouseDragged: return "leftDragged"
         case .leftMouseUp: return "leftUp"
@@ -479,6 +682,32 @@ final class ADBSynchronizer {
         }
 
         return nil
+    }
+
+    private func isEmergencyExitHotkey(_ event: CGEvent) -> Bool {
+        let keycode = Int(event.getIntegerValueField(.keyboardEventKeycode))
+        guard keycode == 53 else { return false }
+        let flags = event.flags
+        return flags.contains(.maskControl) && flags.contains(.maskShift)
+    }
+
+    private func sidebarSystemAction(for event: CGEvent) -> (name: String, keycode: Int)? {
+        let flags = event.flags
+        guard flags.contains(.maskControl), flags.contains(.maskShift) else {
+            return nil
+        }
+
+        let keycode = Int(event.getIntegerValueField(.keyboardEventKeycode))
+        switch keycode {
+        case 18:
+            return ("home", 3)
+        case 19:
+            return ("back", 4)
+        case 23:
+            return ("overview", 187)
+        default:
+            return nil
+        }
     }
 
     private func displaySize() -> CGSize? {
@@ -531,6 +760,16 @@ final class ADBSynchronizer {
             String(fromX), String(fromY),
             String(toX), String(toY),
             String(durationMs)
+        ]) != nil
+    }
+
+    private func sendKeyEvent(serial: String, keycode: Int) -> Bool {
+        guard let adbPath = blueStacksADBPath() else { return false }
+        return runCommand([
+            adbPath,
+            "-s", serial,
+            "shell", "-T", "input", "keyevent",
+            String(keycode)
         ]) != nil
     }
 
@@ -594,6 +833,28 @@ final class ADBSynchronizer {
         )
     }
 
+    private func mappedChromePoint(from globalPoint: CGPoint) -> CGPoint? {
+        guard let sourceWindow = focusedWindowFrame(for: config.sourcePID),
+              let targetWindow = focusedWindowFrame(for: config.targetPID),
+              let sourceContent = interactionFrame(for: config.sourcePID),
+              sourceWindow.contains(globalPoint),
+              !sourceContent.contains(globalPoint),
+              sourceWindow.width > 0,
+              sourceWindow.height > 0 else {
+            return nil
+        }
+
+        let relativeX = (globalPoint.x - sourceWindow.minX) / sourceWindow.width
+        let relativeY = (globalPoint.y - sourceWindow.minY) / sourceWindow.height
+        let clampedX = min(max(relativeX, 0), 1)
+        let clampedY = min(max(relativeY, 0), 1)
+
+        return CGPoint(
+            x: targetWindow.minX + (targetWindow.width * clampedX),
+            y: targetWindow.minY + (targetWindow.height * clampedY)
+        )
+    }
+
     private func mappedDisplayPoint(from globalPoint: CGPoint) -> CGPoint? {
         guard let sourceFrame = interactionFrame(for: config.sourcePID),
               sourceFrame.width > 0,
@@ -612,6 +873,7 @@ final class ADBSynchronizer {
             y: relativeY * displaySize.height
         )
     }
+
 
     private func interactionFrame(for pid: pid_t) -> CGRect? {
         guard let windowFrame = focusedWindowFrame(for: pid) else {
