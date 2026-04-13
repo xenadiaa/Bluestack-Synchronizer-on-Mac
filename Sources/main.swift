@@ -30,6 +30,7 @@ final class AppModel: ObservableObject {
     @Published var sourcePID: pid_t?
     @Published var targetPID: pid_t?
     @Published var verbose = true
+    @Published var dragMode: DragMode = .coalescedSwipe
     @Published var isRunning = false
     @Published var statusText = "未启动"
     @Published var logText = ""
@@ -98,7 +99,10 @@ final class AppModel: ObservableObject {
             return
         }
         process.executableURL = executableURL
-        process.arguments = [bundledHelperFlag] + buildSynchronizerArguments(sourcePID: sourcePID, targetPID: targetPID)
+        process.arguments = [bundledHelperFlag] + buildSynchronizerArguments(
+            sourcePID: sourcePID,
+            targetPID: targetPID
+        )
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -245,6 +249,7 @@ final class AppModel: ObservableObject {
         if verbose {
             arguments.append("--verbose")
         }
+        arguments.append(contentsOf: ["--drag-mode", dragMode.rawValue])
         return arguments
     }
 }
@@ -300,6 +305,18 @@ struct ContentView: View {
             HStack(spacing: 12) {
                 Toggle("详细日志", isOn: $model.verbose)
                     .toggleStyle(.switch)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("拖动方案")
+                        .font(.subheadline)
+                    Picker("拖动方案", selection: $model.dragMode) {
+                        ForEach(DragMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 220)
+                }
 
                 Button("刷新实例") {
                     model.refreshProcesses()

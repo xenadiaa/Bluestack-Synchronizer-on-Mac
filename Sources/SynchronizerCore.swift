@@ -10,6 +10,25 @@ private let blueStacksBundleIDs = [
 ]
 private let blueStacksADBRelativePath = "Contents/MacOS/hd-adb"
 
+enum DragMode: String, CaseIterable, Identifiable {
+    case coalescedSwipe = "coalesced-swipe"
+    case segmentedSwipe = "segmented-swipe"
+    case virtualTouchExperiment = "virtual-touch-experiment"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .coalescedSwipe:
+            return "默认（整段 Swipe）"
+        case .segmentedSwipe:
+            return "实验：分段 Swipe"
+        case .virtualTouchExperiment:
+            return "实验：Virtual Touch"
+        }
+    }
+}
+
 struct Config {
     let sourcePID: pid_t
     let targetPID: pid_t
@@ -17,6 +36,7 @@ struct Config {
     let verbose: Bool
     let mappingFilePathOverride: String?
     let triggerKey: String?
+    let dragMode: DragMode
 }
 
 struct TapMapping {
@@ -145,6 +165,8 @@ final class ADBSynchronizer {
     private var pendingScrollPoint: CGPoint?
     private var pendingScrollStartedAt: CFTimeInterval?
     private var pendingScrollGeneration: Int = 0
+    private var activeLeftTouchLastSent: CGPoint?
+    private var leftDragStreaming = false
     private let injectedMarker: Int64 = 0x53494E43
 
     init(config: Config) {
@@ -197,6 +219,7 @@ final class ADBSynchronizer {
         print("Source PID: \(config.sourcePID)")
         print("Target PID: \(config.targetPID)")
         print("Target ADB serial: \(config.targetADBSerial)")
+        print("Drag mode: \(config.dragMode.rawValue)")
         if let mappingFilePathOverride = config.mappingFilePathOverride {
             print("Mapping file override: \(mappingFilePathOverride)")
         } else {
@@ -210,7 +233,7 @@ final class ADBSynchronizer {
 
     private func buildEventMask() -> CGEventMask {
         let eventTypes: [CGEventType] = [
-            .keyDown, .keyUp,
+            .keyDown, .keyUp, .flagsChanged,
             .mouseMoved,
             .scrollWheel,
             .leftMouseDown, .leftMouseDragged, .leftMouseUp,
@@ -287,6 +310,8 @@ final class ADBSynchronizer {
         switch type {
         case .keyDown:
             return handleKeyDown(event)
+        case .flagsChanged:
+            return handleModifierFlagsChanged(event)
         case .keyUp:
             return Unmanaged.passRetained(event)
         case .mouseMoved,
@@ -354,6 +379,55 @@ final class ADBSynchronizer {
                 }
             } else {
                 print("ADB tap failed for key \(key) on \(config.targetADBSerial)")
+            }
+        }
+
+        return Unmanaged.passRetained(event)
+    }
+
+    private func handleModifierFlagsChanged(_ event: CGEvent) -> Unmanaged<CGEvent>? {
+        let keycode = Int(event.getIntegerValueField(.keyboardEventKeycode))
+        let flags = event.flags
+
+        let isCtrlKey = keycode == 59 || keycode == 62
+        let isShiftKey = keycode == 56 || keycode == 60
+
+        if isCtrlKey && !flags.contains(.maskControl) {
+            return Unmanaged.passRetained(event)
+        }
+        if isShiftKey && !flags.contains(.maskShift) {
+            return Unmanaged.passRetained(event)
+        }
+
+        guard let key = keyIdentifier(for: event) else {
+            return Unmanaged.passRetained(event)
+        }
+
+        adbQueue.async { [self] in
+            guard let context = mappingContext(),
+                  let mapping = context.mappings[key] else {
+                if config.verbose {
+                    print("No tap mapping for key \(key)")
+                }
+                return
+            }
+
+            guard let size = displaySize() else {
+                print("Unable to read Android display size from \(config.targetADBSerial)")
+                return
+            }
+
+            let displayWidth = Int(size.width)
+            let displayHeight = Int(size.height)
+            let x = max(0, min(Int((mapping.xPercent / 100.0) * Double(displayWidth)), displayWidth - 1))
+            let y = max(0, min(Int((mapping.yPercent / 100.0) * Double(displayHeight)), displayHeight - 1))
+
+            if sendTap(serial: config.targetADBSerial, x: x, y: y) {
+                if config.verbose {
+                    print("Tapped modifier \(key) -> (\(x), \(y)) on \(config.targetADBSerial) via \(context.path)")
+                }
+            } else {
+                print("ADB tap failed for modifier \(key) on \(config.targetADBSerial)")
             }
         }
 
@@ -539,39 +613,48 @@ final class ADBSynchronizer {
 
         switch type {
         case .leftMouseDown:
+            let dragMode = config.dragMode
             stateQueue.sync {
                 activeLeftTouchStart = displayPoint
                 activeLeftTouchCurrent = displayPoint
                 activeLeftTouchStartedAt = CFAbsoluteTimeGetCurrent()
+                activeLeftTouchLastSent = displayPoint
             }
             if config.verbose {
-                print("Mirrored mouse leftDown as dragStart -> (\(Int(displayPoint.x)), \(Int(displayPoint.y)))")
+                print("Mirrored mouse leftDown as dragStart [\(dragMode.rawValue)] -> (\(Int(displayPoint.x)), \(Int(displayPoint.y)))")
             }
         case .leftMouseDragged:
             stateQueue.sync {
                 activeLeftTouchCurrent = displayPoint
             }
+            if config.dragMode == .segmentedSwipe {
+                scheduleStreamingDrag()
+            }
             if config.verbose {
                 print("Mirrored mouse leftDragged as dragMove -> (\(Int(displayPoint.x)), \(Int(displayPoint.y)))")
             }
         case .leftMouseUp:
-            let touchPath = stateQueue.sync { () -> (CGPoint, CGPoint, CFTimeInterval)? in
+            let touchPath = stateQueue.sync { () -> (CGPoint, CGPoint, CFTimeInterval, CGPoint)? in
                 guard let start = activeLeftTouchStart else {
                     return nil
                 }
                 let end = activeLeftTouchCurrent ?? displayPoint
                 let startedAt = activeLeftTouchStartedAt ?? CFAbsoluteTimeGetCurrent()
+                let lastSent = activeLeftTouchLastSent ?? start
                 activeLeftTouchStart = nil
                 activeLeftTouchCurrent = nil
                 activeLeftTouchStartedAt = nil
-                return (start, end, startedAt)
+                activeLeftTouchLastSent = nil
+                leftDragStreaming = false
+                return (start, end, startedAt, lastSent)
             }
 
-            let finalPath = touchPath ?? (displayPoint, displayPoint, CFAbsoluteTimeGetCurrent())
+            let finalPath = touchPath ?? (displayPoint, displayPoint, CFAbsoluteTimeGetCurrent(), displayPoint)
             adbQueue.async { [self] in
                 let start = finalPath.0
                 let end = finalPath.1
                 let startedAt = finalPath.2
+                var lastSent = finalPath.3
                 let distance = hypot(end.x - start.x, end.y - start.y)
 
                 if distance < 8 {
@@ -584,21 +667,41 @@ final class ADBSynchronizer {
                         }
                     }
                 } else {
-                    let observedMs = Int(((CFAbsoluteTimeGetCurrent() - startedAt) * 1000).rounded())
-                    let durationMs = max(120, min(1200, observedMs))
-                    let succeeded = sendSwipe(
-                        serial: config.targetADBSerial,
-                        fromX: Int(start.x),
-                        fromY: Int(start.y),
-                        toX: Int(end.x),
-                        toY: Int(end.y),
-                        durationMs: durationMs
-                    )
-                    if config.verbose {
-                        if succeeded {
-                            print("Mirrored mouse leftUp as coalesced drag -> (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y))) duration=\(durationMs)ms")
-                        } else {
-                            print("ADB coalesced drag failed from (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y)))")
+                    switch config.dragMode {
+                    case .coalescedSwipe, .virtualTouchExperiment:
+                        let observedMs = Int(((CFAbsoluteTimeGetCurrent() - startedAt) * 1000).rounded())
+                        let durationMs = max(120, min(1200, observedMs))
+                        let succeeded = sendSwipe(
+                            serial: config.targetADBSerial,
+                            fromX: Int(start.x),
+                            fromY: Int(start.y),
+                            toX: Int(end.x),
+                            toY: Int(end.y),
+                            durationMs: durationMs
+                        )
+                        if config.verbose {
+                            let modeLabel = config.dragMode == .virtualTouchExperiment ? "virtual-touch-experiment (fallback)" : "coalesced drag"
+                            if succeeded {
+                                print("Mirrored mouse leftUp as \(modeLabel) -> (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y))) duration=\(durationMs)ms")
+                            } else {
+                                print("ADB \(modeLabel) failed from (\(Int(start.x)), \(Int(start.y))) to (\(Int(end.x)), \(Int(end.y)))")
+                            }
+                        }
+                    case .segmentedSwipe:
+                        let tailDistance = hypot(end.x - lastSent.x, end.y - lastSent.y)
+                        if tailDistance >= 2 {
+                            _ = sendSwipe(
+                                serial: config.targetADBSerial,
+                                fromX: Int(lastSent.x),
+                                fromY: Int(lastSent.y),
+                                toX: Int(end.x),
+                                toY: Int(end.y),
+                                durationMs: 18
+                            )
+                            lastSent = end
+                        }
+                        if config.verbose {
+                            print("Mirrored mouse leftUp as segmented dragEnd -> (\(Int(start.x)), \(Int(start.y))) to (\(Int(lastSent.x)), \(Int(lastSent.y)))")
                         }
                     }
                 }
@@ -771,6 +874,75 @@ final class ADBSynchronizer {
             "shell", "-T", "input", "keyevent",
             String(keycode)
         ]) != nil
+    }
+
+    private func scheduleStreamingDrag() {
+        let shouldStart = stateQueue.sync { () -> Bool in
+            guard !leftDragStreaming, activeLeftTouchStart != nil else {
+                return false
+            }
+            leftDragStreaming = true
+            return true
+        }
+
+        guard shouldStart else { return }
+
+        adbQueue.async { [self] in
+            while true {
+                let state = stateQueue.sync { () -> (start: CGPoint?, current: CGPoint?, lastSent: CGPoint?) in
+                    (activeLeftTouchStart, activeLeftTouchCurrent, activeLeftTouchLastSent)
+                }
+
+                guard let start = state.start,
+                      let current = state.current else {
+                    stateQueue.sync { leftDragStreaming = false }
+                    return
+                }
+
+                let lastSent = state.lastSent ?? start
+                let distance = hypot(current.x - lastSent.x, current.y - lastSent.y)
+
+                if distance < 2 {
+                    stateQueue.sync { leftDragStreaming = false }
+                    return
+                }
+
+                let succeeded = sendSwipe(
+                    serial: config.targetADBSerial,
+                    fromX: Int(lastSent.x),
+                    fromY: Int(lastSent.y),
+                    toX: Int(current.x),
+                    toY: Int(current.y),
+                    durationMs: 18
+                )
+
+                stateQueue.sync {
+                    activeLeftTouchLastSent = current
+                    leftDragStreaming = false
+                }
+
+                if config.verbose && !succeeded {
+                    print("ADB drag segment failed from (\(Int(lastSent.x)), \(Int(lastSent.y))) to (\(Int(current.x)), \(Int(current.y)))")
+                }
+
+                let needsAnotherPass = stateQueue.sync { () -> Bool in
+                    guard let newest = activeLeftTouchCurrent,
+                          let newestLastSent = activeLeftTouchLastSent,
+                          activeLeftTouchStart != nil else {
+                        return false
+                    }
+                    if hypot(newest.x - newestLastSent.x, newest.y - newestLastSent.y) >= 2 {
+                        leftDragStreaming = true
+                        return true
+                    }
+                    return false
+                }
+
+                if !needsAnotherPass {
+                    return
+                }
+            }
+        }
     }
 
     private func runCommand(_ args: [String]) -> String? {
@@ -1177,6 +1349,7 @@ func normalizeBlueStacksKey(_ key: String) -> String {
     switch lower {
     case "space": return "space"
     case "ctrl", "control": return "ctrl"
+    case "shift": return "shift"
     case "tab": return "tab"
     case "mouserbutton": return "mouserbutton"
     case "oem3": return "oem3"
@@ -1200,6 +1373,7 @@ func parseSynchronizerArguments(_ args: [String]) -> Config? {
     var mappingFilePath: String?
     var triggerKey: String?
     var targetADBSerialOverride: String?
+    var dragMode = DragMode.coalescedSwipe
 
     var index = 0
     while index < args.count {
@@ -1227,6 +1401,10 @@ func parseSynchronizerArguments(_ args: [String]) -> Config? {
             targetADBSerialOverride = args[index]
         case "--verbose":
             verbose = true
+        case "--drag-mode":
+            index += 1
+            guard index < args.count, let value = DragMode(rawValue: args[index]) else { return nil }
+            dragMode = value
         case "--help":
             return nil
         default:
@@ -1258,7 +1436,8 @@ func parseSynchronizerArguments(_ args: [String]) -> Config? {
         targetADBSerial: targetADBSerial,
         verbose: verbose,
         mappingFilePathOverride: mappingFilePath,
-        triggerKey: triggerKey
+        triggerKey: triggerKey,
+        dragMode: dragMode
     )
 }
 
@@ -1276,7 +1455,9 @@ let fallbackKeyMap: [Int: String] = [
     32: "u", 34: "i", 35: "p", 37: "l", 38: "j", 40: "k", 45: "n",
     46: "m", 18: "1", 19: "2", 20: "3", 21: "4", 23: "5", 22: "6",
     26: "7", 28: "8", 25: "9", 29: "0", 48: "tab", 49: "space",
-    59: "ctrl", 123: "left", 124: "right", 125: "down", 126: "up"
+    56: "shift", 60: "shift",
+    59: "ctrl", 62: "ctrl",
+    123: "left", 124: "right", 125: "down", 126: "up"
 ]
 
 func runBundledSynchronizer(with arguments: [String]) -> Never {
